@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::{HashMap, VecDeque},
     path::{Path, PathBuf},
 };
@@ -78,6 +79,76 @@ impl RojoTree {
     pub fn root(&self) -> InstanceWithMeta<'_> {
         self.get_instance(self.get_root_id())
             .expect("RojoTrees should have a root")
+    }
+
+    /// Materializes the current tree into a snapshot, including Rojo metadata.
+    ///
+    /// This is used to give contextual transformers a stable, read-only view
+    /// of the project without exposing the live synchronization tree.
+    pub(crate) fn snapshot(&self) -> InstanceSnapshot {
+        enum Task {
+            Visit(Ref),
+            Assemble(Box<InstanceSnapshot>, usize),
+        }
+
+        let mut tasks = vec![Task::Visit(self.get_root_id())];
+        let mut results = Vec::new();
+
+        while let Some(task) = tasks.pop() {
+            match task {
+                Task::Visit(id) => {
+                    let instance = self
+                        .inner
+                        .get_by_ref(id)
+                        .expect("instance did not exist in tree");
+                    let metadata = self
+                        .metadata_map
+                        .get(&id)
+                        .expect("metadata did not exist for instance");
+                    let children = instance.children();
+
+                    tasks.push(Task::Assemble(
+                        Box::new(InstanceSnapshot {
+                            snapshot_id: id,
+                            metadata: metadata.clone(),
+                            name: Cow::Owned(instance.name.clone()),
+                            class_name: instance.class,
+                            properties: instance.properties.clone(),
+                            children: Vec::new(),
+                        }),
+                        children.len(),
+                    ));
+                    for &child_id in children.iter().rev() {
+                        tasks.push(Task::Visit(child_id));
+                    }
+                }
+                Task::Assemble(mut snapshot, child_count) => {
+                    snapshot.children = results.split_off(results.len() - child_count);
+                    results.push(*snapshot);
+                }
+            }
+        }
+
+        results.pop().expect("tree did not produce a snapshot")
+    }
+
+    pub(crate) fn instance_path(&self, id: Ref) -> Option<Vec<String>> {
+        let mut path = Vec::new();
+        let mut current = id;
+
+        loop {
+            let instance = self.inner.get_by_ref(current)?;
+            path.push(instance.name.clone());
+
+            let parent = instance.parent();
+            if parent.is_none() {
+                break;
+            }
+            current = parent;
+        }
+
+        path.reverse();
+        Some(path)
     }
 
     pub fn get_instance(&self, id: Ref) -> Option<InstanceWithMeta<'_>> {

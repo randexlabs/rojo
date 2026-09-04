@@ -31,11 +31,17 @@ Making a new release? Simply add the new header with the version and date undern
 
 ## Unreleased
 
+## [7.8.0] (September 4th, 2026)
+
+* Added an extensible transformer protocol for processing snapshots before Rojo computes synchronization patches.
+* Added a personal require-by-string transformer that resolves manifest aliases from `.luaurc` and `.config.luau` into Roblox instance paths.
+
 * Fixed `$path` values that point outside the project folder failing to match `syncRule`s on Windows, which broke `rojo sourcemap` with a "could not be turned into a Roblox Instance" error. ([#1290])
 * Fixed `rojo serve` silently stopping syncing file changes on Windows when the served project path was a verbatim (`\\?\`) path, because tree paths and file-watcher event paths were canonicalized to different forms. ([#1290])
 * Fixed `rojo sourcemap --absolute` emitting verbatim (`\\?\`) paths on Windows, which broke require types in luau-lsp. ([#1290])
 * The plugin now disables the `Check for Updates` setting if you block access to `api.github.com`. ([#1297])
 
+[7.8.0]: https://github.com/randexlabs/rojo/releases/tag/v7.8.0
 [#1290]: https://github.com/rojo-rbx/rojo/pull/1290
 [#1297]: https://github.com/rojo-rbx/rojo/pull/1297
 

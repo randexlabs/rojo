@@ -15,6 +15,7 @@ mod lua_ast;
 mod message_queue;
 mod multimap;
 mod path_serializer;
+mod personal;
 mod project;
 mod resolution;
 mod rojo_ref;
@@ -23,6 +24,7 @@ mod session_id;
 mod snapshot;
 mod snapshot_middleware;
 mod syncback;
+mod transformer;
 mod variant_eq;
 mod web;
 
@@ -37,4 +39,5 @@ pub use snapshot::{
 };
 pub use snapshot_middleware::{snapshot_from_vfs, Middleware, ScriptType};
 pub use syncback::{syncback_loop, FsSnapshot, SyncbackData, SyncbackSnapshot};
+pub use transformer::{TransformChange, TransformContext, Transformer, TransformerPipeline};
 pub use web::interface as web_api;

@@ -11,9 +11,11 @@ use std::{
 use crate::{
     message_queue::MessageQueue,
     snapshot::{
-        apply_patch_set, compute_patch_set, AppliedPatchSet, InstigatingSource, PatchSet, RojoTree,
+        apply_patch_set, compute_patch_set, AppliedPatchSet, InstanceSnapshot, InstigatingSource,
+        PatchSet, RojoTree,
     },
     snapshot_middleware::{snapshot_from_vfs, snapshot_project_node},
+    transformer::{TransformChange, TransformContext, TransformerPipeline},
 };
 
 /// Processes file change events, updates the DOM, and sends those updates
@@ -50,14 +52,16 @@ impl ChangeProcessor {
         tree: Arc<Mutex<RojoTree>>,
         vfs: Arc<Vfs>,
         message_queue: Arc<MessageQueue<AppliedPatchSet>>,
+        transformers: TransformerPipeline,
         tree_mutation_receiver: Receiver<PatchSet>,
     ) -> Self {
         let (shutdown_sender, shutdown_receiver) = crossbeam_channel::bounded(1);
         let vfs_receiver = vfs.event_receiver();
-        let task = JobThreadContext {
+        let mut task = JobThreadContext {
             tree,
             vfs,
             message_queue,
+            transformers,
         };
 
         let job_thread = jod_thread::Builder::new()
@@ -111,6 +115,9 @@ struct JobThreadContext {
     /// Whenever changes are applied to the DOM, we should push those changes
     /// into this message queue to inform any connected clients.
     message_queue: Arc<MessageQueue<AppliedPatchSet>>,
+
+    /// Transforms snapshots before they are diffed against the current tree.
+    transformers: TransformerPipeline,
 }
 
 impl JobThreadContext {
@@ -120,7 +127,7 @@ impl JobThreadContext {
     /// in the tree.
     /// It then computes and applies changes for each affected instance ID and
     /// returns a vector of applied patch sets.
-    fn apply_patches(&self, path: PathBuf) -> Vec<AppliedPatchSet> {
+    fn apply_patches(&mut self, path: PathBuf) -> Vec<AppliedPatchSet> {
         let mut tree = self.tree.lock().unwrap();
         let mut applied_patches = Vec::new();
 
@@ -146,8 +153,21 @@ impl JobThreadContext {
             }
         };
 
+        let root_snapshot =
+            if !affected_ids.is_empty() && self.transformers.needs_project_snapshot() {
+                Some(tree.snapshot())
+            } else {
+                None
+            };
+
         for id in affected_ids {
-            if let Some(patch) = compute_and_apply_changes(&mut tree, &self.vfs, id) {
+            if let Some(patch) = compute_and_apply_changes(
+                &mut tree,
+                &self.vfs,
+                &mut self.transformers,
+                root_snapshot.as_ref(),
+                id,
+            ) {
                 if !patch.is_empty() {
                     applied_patches.push(patch);
                 }
@@ -157,7 +177,7 @@ impl JobThreadContext {
         applied_patches
     }
 
-    fn handle_vfs_event(&self, event: VfsEvent) {
+    fn handle_vfs_event(&mut self, event: VfsEvent) {
         log::trace!("Vfs event: {:?}", event);
 
         // Update the VFS immediately with the event.
@@ -165,24 +185,25 @@ impl JobThreadContext {
             .commit_event(&event)
             .expect("Error applying VFS change");
 
+        let normalized_path = canonical_event_path(&self.vfs, &event);
+        let transform_change = match (&event, normalized_path.as_ref()) {
+            (VfsEvent::Create(_), Some(path)) => Some(TransformChange::Created(path.clone())),
+            (VfsEvent::Write(_), Some(path)) => Some(TransformChange::Written(path.clone())),
+            (VfsEvent::Remove(_), Some(path)) => Some(TransformChange::Removed(path.clone())),
+            _ => None,
+        };
+
+        if let Some(change) = &transform_change {
+            self.transformers.handle_change(change);
+        }
+
         // For a given VFS event, we might have many changes to different parts
         // of the tree. Calculate and apply all of these changes.
-        let applied_patches = match event {
-            VfsEvent::Create(path) | VfsEvent::Write(path) => {
-                self.apply_patches(self.vfs.canonicalize(&path).unwrap())
-            }
-            VfsEvent::Remove(path) => {
-                // MemoFS does not track parent removals yet, so we can canonicalize
-                // the parent path safely and then append the removed path's file name.
-                let parent = path.parent().unwrap();
-                let file_name = path.file_name().unwrap();
-                let parent_normalized = self.vfs.canonicalize(parent).unwrap();
-                self.apply_patches(parent_normalized.join(file_name))
-            }
-            _ => {
-                log::warn!("Unhandled VFS event: {:?}", event);
-                Vec::new()
-            }
+        let applied_patches = if let Some(path) = normalized_path {
+            self.apply_patches(path)
+        } else {
+            log::warn!("Unhandled VFS event: {:?}", event);
+            Vec::new()
         };
 
         // Notify anyone listening to the message queue about the changes we
@@ -294,7 +315,32 @@ impl JobThreadContext {
     }
 }
 
-fn compute_and_apply_changes(tree: &mut RojoTree, vfs: &Vfs, id: Ref) -> Option<AppliedPatchSet> {
+fn canonical_event_path(vfs: &Vfs, event: &VfsEvent) -> Option<PathBuf> {
+    match event {
+        VfsEvent::Create(path) | VfsEvent::Write(path) => Some(vfs.canonicalize(path).unwrap()),
+        VfsEvent::Remove(path) => {
+            // MemoFS does not track parent removals yet, so we can canonicalize
+            // the parent safely and append the removed path's file name.
+            let parent = path.parent().unwrap();
+            let file_name = path.file_name().unwrap();
+            Some(vfs.canonicalize(parent).unwrap().join(file_name))
+        }
+        _ => None,
+    }
+}
+
+fn compute_and_apply_changes(
+    tree: &mut RojoTree,
+    vfs: &Vfs,
+    transformers: &mut TransformerPipeline,
+    root_snapshot: Option<&InstanceSnapshot>,
+    id: Ref,
+) -> Option<AppliedPatchSet> {
+    let instance_path = tree
+        .instance_path(id)
+        .expect("instance did not exist in tree");
+    let transform_context = TransformContext::with_optional_root(root_snapshot, instance_path);
+
     let metadata = tree
         .get_metadata(id)
         .expect("metadata missing for instance present in tree");
@@ -320,7 +366,11 @@ fn compute_and_apply_changes(tree: &mut RojoTree, vfs: &Vfs, id: Ref) -> Option<
                 // path still exists. We can generate a snapshot starting at
                 // that path and use it as the source for our patch.
 
-                let snapshot = match snapshot_from_vfs(&metadata.context, vfs, path) {
+                let snapshot = match transform_snapshot(
+                    snapshot_from_vfs(&metadata.context, vfs, path),
+                    transformers,
+                    &transform_context,
+                ) {
                     Ok(snapshot) => snapshot,
                     Err(err) => {
                         log::error!("Snapshot error: {:?}", err);
@@ -340,6 +390,8 @@ fn compute_and_apply_changes(tree: &mut RojoTree, vfs: &Vfs, id: Ref) -> Option<
 
                 let mut patch_set = PatchSet::new();
                 patch_set.removed_instances.push(id);
+
+                transformers.remove_instance(&transform_context);
 
                 apply_patch_set(tree, patch_set)
             }
@@ -368,13 +420,14 @@ fn compute_and_apply_changes(tree: &mut RojoTree, vfs: &Vfs, id: Ref) -> Option<
                 parent_class.as_ref().map(|name| name.as_str()),
             );
 
-            let snapshot = match snapshot_result {
-                Ok(snapshot) => snapshot,
-                Err(err) => {
-                    log::error!("{:?}", err);
-                    return None;
-                }
-            };
+            let snapshot =
+                match transform_snapshot(snapshot_result, transformers, &transform_context) {
+                    Ok(snapshot) => snapshot,
+                    Err(err) => {
+                        log::error!("{:?}", err);
+                        return None;
+                    }
+                };
 
             let patch_set = compute_patch_set(snapshot, tree, id);
             apply_patch_set(tree, patch_set)
@@ -382,4 +435,14 @@ fn compute_and_apply_changes(tree: &mut RojoTree, vfs: &Vfs, id: Ref) -> Option<
     };
 
     Some(applied_patch_set)
+}
+
+fn transform_snapshot(
+    snapshot: anyhow::Result<Option<InstanceSnapshot>>,
+    transformers: &mut TransformerPipeline,
+    context: &TransformContext<'_>,
+) -> anyhow::Result<Option<InstanceSnapshot>> {
+    snapshot?
+        .map(|snapshot| transformers.transform_with_context(snapshot, context))
+        .transpose()
 }

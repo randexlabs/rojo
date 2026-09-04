@@ -14,6 +14,7 @@ use thiserror::Error;
 use crate::{
     change_processor::ChangeProcessor,
     message_queue::MessageQueue,
+    personal::transformer_pipeline,
     project::{Project, ProjectError},
     session_id::SessionId,
     snapshot::{
@@ -21,6 +22,7 @@ use crate::{
         PatchSet, RojoTree,
     },
     snapshot_middleware::snapshot_from_vfs,
+    transformer::TransformerPipeline,
 };
 
 /// Contains all of the state for a Rojo serve session. A serve session is used
@@ -95,6 +97,30 @@ impl ServeSession {
     /// currently loaded from the filesystem directly instead of through the
     /// in-memory filesystem layer.
     pub fn new<P: AsRef<Path>>(vfs: Vfs, start_path: P) -> Result<Self, ServeSessionError> {
+        let vfs = Arc::new(vfs);
+        Self::new_with_transformers_arc(
+            Arc::clone(&vfs),
+            start_path,
+            transformer_pipeline(Arc::clone(&vfs)),
+        )
+    }
+
+    /// Starts a new serve session with an ordered pipeline of snapshot
+    /// transformers.
+    #[allow(dead_code)]
+    pub fn new_with_transformers<P: AsRef<Path>>(
+        vfs: Vfs,
+        start_path: P,
+        transformers: TransformerPipeline,
+    ) -> Result<Self, ServeSessionError> {
+        Self::new_with_transformers_arc(Arc::new(vfs), start_path, transformers)
+    }
+
+    fn new_with_transformers_arc<P: AsRef<Path>>(
+        vfs: Arc<Vfs>,
+        start_path: P,
+        mut transformers: TransformerPipeline,
+    ) -> Result<Self, ServeSessionError> {
         let start_time = Instant::now();
         let start_path = vfs.canonicalize(start_path.as_ref())?;
         let start_path = start_path.as_path();
@@ -111,7 +137,9 @@ impl ServeSession {
             InstanceContext::with_emit_legacy_scripts(root_project.emit_legacy_scripts);
 
         log::trace!("Generating snapshot of instances from VFS");
-        let snapshot = snapshot_from_vfs(&instance_context, &vfs, start_path)?;
+        let snapshot = snapshot_from_vfs(&instance_context, &vfs, start_path)?
+            .map(|snapshot| transformers.transform(snapshot))
+            .transpose()?;
 
         log::trace!("Computing initial patch set");
         let patch_set = compute_patch_set(snapshot, &tree, root_id);
@@ -124,7 +152,6 @@ impl ServeSession {
 
         let tree = Arc::new(Mutex::new(tree));
         let message_queue = Arc::new(message_queue);
-        let vfs = Arc::new(vfs);
 
         let (tree_mutation_sender, tree_mutation_receiver) = crossbeam_channel::unbounded();
 
@@ -133,6 +160,7 @@ impl ServeSession {
             Arc::clone(&tree),
             Arc::clone(&vfs),
             Arc::clone(&message_queue),
+            transformers,
             tree_mutation_receiver,
         );
 
@@ -244,9 +272,26 @@ pub enum ServeSessionError {
 
 #[cfg(test)]
 mod test {
+    use std::borrow::Cow;
+
+    use rbx_dom_weak::{types::Variant, ustr};
+
     use super::*;
 
     use memofs::StdBackend;
+
+    struct RenameTransformer;
+
+    impl crate::Transformer for RenameTransformer {
+        fn transform(
+            &mut self,
+            mut snapshot: InstanceSnapshot,
+            _context: &crate::TransformContext<'_>,
+        ) -> anyhow::Result<InstanceSnapshot> {
+            snapshot.name = Cow::Borrowed("Transformed");
+            Ok(snapshot)
+        }
+    }
 
     #[test]
     fn tree_is_keyed_by_canonical_paths() {
@@ -274,6 +319,124 @@ mod test {
              path {}, matching what the watcher reports",
             project_file.display(),
             canonical.display(),
+        );
+    }
+
+    #[test]
+    fn new_with_transformers_applies_transformers_to_initial_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("default.project.json"),
+            r#"{ "name": "test", "tree": { "$className": "Folder" } }"#,
+        )
+        .unwrap();
+
+        let start_path = std::fs::canonicalize(dir.path()).unwrap();
+        let vfs = Vfs::new(StdBackend::new().unwrap());
+        let session = ServeSession::new_with_transformers(
+            vfs,
+            &start_path,
+            TransformerPipeline::new().with(RenameTransformer),
+        )
+        .unwrap();
+
+        let tree = session.tree();
+        let root_id = tree.get_root_id();
+        let root = tree.get_instance(root_id).unwrap();
+
+        assert_eq!(root.name(), "Transformed");
+    }
+
+    #[test]
+    fn smoke_test_transforms_manifest_alias_into_a_roblox_module_expression() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("default.project.json"),
+            r#"{
+                "name": "test",
+                "tree": {
+                    "$className": "Folder",
+                    "Main": { "$path": "main.luau" },
+                    "Source": { "$path": "src" }
+                }
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join(".luaurc"),
+            r#"{ "aliases": { "src": "./src" } }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("main.luau"),
+            r#"return require("@src/dep")"#,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("src/dep.luau"), "return {}".as_bytes()).unwrap();
+
+        let start_path = std::fs::canonicalize(dir.path()).unwrap();
+        let vfs = Vfs::new(StdBackend::new().unwrap());
+        let session = ServeSession::new(vfs, &start_path).unwrap();
+
+        let tree = session.tree();
+        let root = tree.root();
+        let main_id = root
+            .children()
+            .iter()
+            .copied()
+            .find(|&id| tree.get_instance(id).unwrap().name() == "Main")
+            .unwrap();
+        let main = tree.get_instance(main_id).unwrap();
+        let Variant::String(source) = main.properties().get(&ustr("Source")).unwrap() else {
+            panic!("expected Main.Source to be a string");
+        };
+
+        assert_eq!(
+            source.as_str(),
+            "return require(script.Parent:WaitForChild(\"Source\"):WaitForChild(\"dep\"))"
+        );
+    }
+
+    #[test]
+    fn smoke_test_rejects_alias_module_outside_rojo_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("default.project.json"),
+            r#"{
+                "name": "test",
+                "tree": {
+                    "$className": "Folder",
+                    "Main": { "$path": "main.luau" }
+                }
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join(".luaurc"),
+            r#"{ "aliases": { "src": "./src" } }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("main.luau"),
+            r#"return require("@src/dep")"#,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("src/dep.luau"), "return {}".as_bytes()).unwrap();
+
+        let start_path = std::fs::canonicalize(dir.path()).unwrap();
+        let vfs = Vfs::new(StdBackend::new().unwrap());
+        let error = match ServeSession::new(vfs, &start_path) {
+            Ok(_) => panic!("an alias target outside the Rojo tree must be rejected"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("is not present in the Rojo tree"),
+            "unexpected error: {error}"
         );
     }
 }
